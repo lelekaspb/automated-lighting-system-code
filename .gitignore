@@ -1,0 +1,6 @@
+platformio.ini
+.pio/
+.vscode/
+settings.json
+
+/arduino/

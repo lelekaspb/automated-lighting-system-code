@@ -20,6 +20,7 @@ Current behavior:
 - LED brightness is fixed at `50` by `FastLED.setBrightness(50)`; it is not automatically adjusted.
 
 ## Hardware
+See [ESP32 pin reference](esp32_pin_reference.md) for board details and GPIO notes.
 
 | Component | Details |
 | --- | --- |
