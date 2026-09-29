@@ -126,6 +126,7 @@ If uploading stalls at `Connecting...`, hold the board's **BOOT** button while u
 ## Dependency
 
 - [FastLED](https://fastled.io/) - install through Arduino IDE Library Manager.
+- [PubSubClient](https://github.com/knolleary/pubsubclient) by Nick O'Leary - install through Arduino IDE Library Manager for MQTT support.
 
 ## Glossary
 
