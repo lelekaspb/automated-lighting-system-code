@@ -79,23 +79,6 @@ struct MqttConfig {
 
 MqttConfig mqttConfig;
 
-// SAVING (move to a separate branch): needs mqttConfig initialised from the MQTT_* macros.
-// MqttConfig mqttConfig = {MQTT_SERVER_HOST, MQTT_SERVER_PORT, MQTT_USERNAME, MQTT_PASSWORD, MQTT_CLIENT_ID, MQTT_COLOR_TOPIC};
-/*
-void saveMqttConfig(const MqttConfig& config) {
-  // Save the MQTT configuration to persistent storage.
-  Preferences preferences;
-  preferences.begin("mqtt", false);
-  preferences.putString("server_host", config.serverHost);
-  preferences.putUInt("server_port", config.serverPort);
-  preferences.putString("username", config.username);
-  preferences.putString("password", config.password);
-  preferences.putString("client_id", config.clientId);
-  preferences.putString("color_topic", config.colorTopic);
-  preferences.end();
-}
-*/
-
 void loadMqttConfig(MqttConfig& config) {
   // Load the MQTT configuration from persistent storage.
   Preferences preferences;
@@ -249,7 +232,6 @@ void updateLdrState() {
 
 void setup() {
   Serial.begin(115200);
-  // saveMqttConfig(mqttConfig);
   loadMqttConfig(mqttConfig);
   if (USE_STRIP_POWER_SWITCH) {
     pinMode(SWITCH_PIN, OUTPUT);
