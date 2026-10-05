@@ -170,8 +170,9 @@ void startWifiProvisioning() {
   pop = mac.substring(4);
 
   Serial.printf("BLE provisioning name: %s, PoP: %s\n", serviceName.c_str(), pop.c_str());
+  // Temporary: true wipes stored Wi-Fi credentials on every boot; set back to false after provisioning.
   WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
-                          NETWORK_PROV_SECURITY_1, pop.c_str(), serviceName.c_str());
+                          NETWORK_PROV_SECURITY_1, pop.c_str(), serviceName.c_str(), NULL, NULL, true);
 }
 
 void connectMqttIfNeeded() {
