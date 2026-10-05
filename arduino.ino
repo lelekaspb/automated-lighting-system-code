@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include "mqtt_root_ca.h"
+#include <Preferences.h>
 
 #if __has_include("mqtt_config.h")
 #include "mqtt_config.h"
@@ -67,6 +68,47 @@ uint32_t lastMqttAttempt = 0;
 uint32_t lastLdrRead = 0;
 bool timeSyncStarted = false;
 
+struct MqttConfig {
+  String serverHost;
+  uint16_t serverPort;
+  String username;
+  String password;
+  String clientId;
+  String colorTopic;
+};
+
+MqttConfig mqttConfig;
+
+// SAVING (move to a separate branch): needs mqttConfig initialised from the MQTT_* macros.
+// MqttConfig mqttConfig = {MQTT_SERVER_HOST, MQTT_SERVER_PORT, MQTT_USERNAME, MQTT_PASSWORD, MQTT_CLIENT_ID, MQTT_COLOR_TOPIC};
+/*
+void saveMqttConfig(const MqttConfig& config) {
+  // Save the MQTT configuration to persistent storage.
+  Preferences preferences;
+  preferences.begin("mqtt", false);
+  preferences.putString("server_host", config.serverHost);
+  preferences.putUInt("server_port", config.serverPort);
+  preferences.putString("username", config.username);
+  preferences.putString("password", config.password);
+  preferences.putString("client_id", config.clientId);
+  preferences.putString("color_topic", config.colorTopic);
+  preferences.end();
+}
+*/
+
+void loadMqttConfig(MqttConfig& config) {
+  // Load the MQTT configuration from persistent storage.
+  Preferences preferences;
+  preferences.begin("mqtt", true);
+  config.serverHost = preferences.getString("server_host", "").c_str();
+  config.serverPort = preferences.getUInt("server_port", 8883);
+  config.username = preferences.getString("username", "").c_str();
+  config.password = preferences.getString("password", "").c_str();
+  config.clientId = preferences.getString("client_id", "esp32-neopixel").c_str();
+  config.colorTopic = preferences.getString("color_topic", "esp32/led/color").c_str();
+  preferences.end();
+}
+
 void configureLdrAdc() {
   // Allow up to ~3.3V on the ADC input before clipping.
   analogSetPinAttenuation(LDR_PIN, ADC_11db);
@@ -115,7 +157,7 @@ void applyLedState() {
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, MQTT_COLOR_TOPIC) != 0 || length >= 32) {
+  if (strcmp(topic, mqttConfig.colorTopic.c_str()) != 0 || length >= 32) {
     return;
   }
 
@@ -157,7 +199,7 @@ void connectWifiIfNeeded() {
 }
 
 void connectMqttIfNeeded() {
-  if (mqttClient.connected() || WiFi.status() != WL_CONNECTED || MQTT_SERVER_HOST[0] == '\0') {
+  if (mqttClient.connected() || WiFi.status() != WL_CONNECTED || mqttConfig.serverHost.isEmpty()) {
     return;
   }
   if (time(nullptr) < 1700000000) {
@@ -171,15 +213,15 @@ void connectMqttIfNeeded() {
 
   lastMqttAttempt = now;
   bool connected;
-  if (MQTT_USERNAME[0] == '\0') {
-    connected = mqttClient.connect(MQTT_CLIENT_ID);
+  if (mqttConfig.username.isEmpty()) {
+    connected = mqttClient.connect(mqttConfig.clientId.c_str());
   } else {
-    connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+    connected = mqttClient.connect(mqttConfig.clientId.c_str(), mqttConfig.username.c_str(), mqttConfig.password.c_str());
   }
 
   if (connected) {
-    Serial.printf("Connected to MQTT; subscribing to %s\n", MQTT_COLOR_TOPIC);
-    mqttClient.subscribe(MQTT_COLOR_TOPIC);
+    Serial.printf("Connected to MQTT; subscribing to %s\n", mqttConfig.colorTopic.c_str());
+    mqttClient.subscribe(mqttConfig.colorTopic.c_str());
   } else {
     Serial.printf("MQTT connection failed, state %d\n", mqttClient.state());
   }
@@ -207,6 +249,8 @@ void updateLdrState() {
 
 void setup() {
   Serial.begin(115200);
+  // saveMqttConfig(mqttConfig);
+  loadMqttConfig(mqttConfig);
   if (USE_STRIP_POWER_SWITCH) {
     pinMode(SWITCH_PIN, OUTPUT);
     setStripPower(false);
@@ -232,7 +276,7 @@ void setup() {
   }
   applyLedState();
 
-  mqttClient.setServer(MQTT_SERVER_HOST, MQTT_SERVER_PORT);
+  mqttClient.setServer(mqttConfig.serverHost.c_str(), mqttConfig.serverPort);
   mqttClient.setCallback(onMqttMessage);
   wifiClient.setCACert(mqttRootCa);
   WiFi.mode(WIFI_STA);
