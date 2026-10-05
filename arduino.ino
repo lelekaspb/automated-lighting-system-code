@@ -7,17 +7,12 @@
 #include <time.h>
 #include "mqtt_root_ca.h"
 #include <Preferences.h>
+#include <WiFiProv.h>
 
 #if __has_include("mqtt_config.h")
 #include "mqtt_config.h"
 #endif
 
-#ifndef WIFI_SSID
-#define WIFI_SSID ""
-#endif
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD ""
-#endif
 #ifndef MQTT_SERVER_HOST
 #define MQTT_SERVER_HOST ""
 #endif
@@ -63,7 +58,6 @@ CRGB currentColor(255, 200, 100);
 bool isLight = false;
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
-uint32_t lastWifiAttempt = 0;
 uint32_t lastMqttAttempt = 0;
 uint32_t lastLdrRead = 0;
 bool timeSyncStarted = false;
@@ -166,19 +160,18 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-void connectWifiIfNeeded() {
-  if (WiFi.status() == WL_CONNECTED || WIFI_SSID[0] == '\0') {
-    return;
-  }
+void startWifiProvisioning() {
+  // Does nothing visible if credentials are already stored; otherwise advertises over BLE.
+  static String serviceName;
+  static String pop;
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  serviceName = "PROV_" + mac.substring(6);
+  pop = mac.substring(4);
 
-  uint32_t now = millis();
-  if (lastWifiAttempt != 0 && now - lastWifiAttempt < 10000) {
-    return;
-  }
-
-  lastWifiAttempt = now;
-  Serial.printf("Connecting to Wi-Fi: %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("BLE provisioning name: %s, PoP: %s\n", serviceName.c_str(), pop.c_str());
+  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                          NETWORK_PROV_SECURITY_1, pop.c_str(), serviceName.c_str());
 }
 
 void connectMqttIfNeeded() {
@@ -261,12 +254,10 @@ void setup() {
   mqttClient.setServer(mqttConfig.serverHost.c_str(), mqttConfig.serverPort);
   mqttClient.setCallback(onMqttMessage);
   wifiClient.setCACert(mqttRootCa);
-  WiFi.mode(WIFI_STA);
-  connectWifiIfNeeded();
+  startWifiProvisioning();
 }
 
 void loop() {
-  connectWifiIfNeeded();
   if (WiFi.status() == WL_CONNECTED && !timeSyncStarted) {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     timeSyncStarted = true;
