@@ -7,12 +7,17 @@
 #include <time.h>
 #include "mqtt_root_ca.h"
 #include <Preferences.h>
-#include <WiFiProv.h>
 
 #if __has_include("mqtt_config.h")
 #include "mqtt_config.h"
 #endif
 
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 #ifndef MQTT_SERVER_HOST
 #define MQTT_SERVER_HOST ""
 #endif
@@ -160,21 +165,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-void startWifiProvisioning() {
-  // Does nothing visible if credentials are already stored; otherwise advertises over BLE.
-  static String serviceName;
-  static String pop;
-  String mac = WiFi.macAddress();
-  mac.replace(":", "");
-  serviceName = "PROV_" + mac.substring(6);
-  pop = mac.substring(4);
-
-  Serial.printf("BLE provisioning name: %s, PoP: %s\n", serviceName.c_str(), pop.c_str());
-  // Temporary: true wipes stored Wi-Fi credentials on every boot; set back to false after provisioning.
-  WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
-                          NETWORK_PROV_SECURITY_1, pop.c_str(), serviceName.c_str(), NULL, NULL, true);
-}
-
 void connectMqttIfNeeded() {
   if (mqttClient.connected() || WiFi.status() != WL_CONNECTED || mqttConfig.serverHost.isEmpty()) {
     return;
@@ -255,7 +245,9 @@ void setup() {
   mqttClient.setServer(mqttConfig.serverHost.c_str(), mqttConfig.serverPort);
   mqttClient.setCallback(onMqttMessage);
   wifiClient.setCACert(mqttRootCa);
-  startWifiProvisioning();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Connecting to Wi-Fi network: %s\n", WIFI_SSID);
 }
 
 void loop() {
