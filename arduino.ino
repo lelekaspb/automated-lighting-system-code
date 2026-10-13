@@ -32,6 +32,10 @@
 #ifndef MQTT_COLOR_TOPIC
 #define MQTT_COLOR_TOPIC "esp32/led/color"
 #endif
+#ifndef MQTT_BRIGHTNESS_TOPIC
+#define MQTT_BRIGHTNESS_TOPIC "esp32/led/brightness"
+#endif
+#define MAX_BRIGHTNESS 80
 
 #define NUM_LEDS 137
 #define DATA_PIN 5
@@ -56,6 +60,7 @@
 
 CRGB leds[NUM_LEDS];
 CRGB currentColor(255, 200, 100);
+uint8_t currentBrightness = 20;
 bool isLight = false;
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -145,6 +150,7 @@ struct MqttConfig {
   String password;
   String clientId;
   String colorTopic;
+  String brightnessTopic;
 };
 
 MqttConfig mqttConfig;
@@ -159,6 +165,7 @@ void loadMqttConfig() {
   mqttConfig.password = preferences.getString("password", "").c_str();
   mqttConfig.clientId = preferences.getString("client_id", "esp32-neopixel").c_str();
   mqttConfig.colorTopic = preferences.getString("color_topic", "esp32/led/color").c_str();
+  mqttConfig.brightnessTopic = preferences.getString("brightness_topic", "esp32/led/brightness").c_str();
   preferences.end();
 }
 
@@ -210,13 +217,32 @@ void applyLedState() {
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, mqttConfig.colorTopic.c_str()) != 0 || length >= 32) {
+  if (length >= 32) {
     return;
   }
 
   char message[32];
   memcpy(message, payload, length);
   message[length] = '\0';
+
+  if(strcmp(topic, mqttConfig.brightnessTopic.c_str()) == 0) {
+    int value = atoi(message);
+    if (value > MAX_BRIGHTNESS) {
+      value = MAX_BRIGHTNESS;
+    }
+    if (value < 0) {
+      value = 0;
+    }
+    currentBrightness = value;
+    FastLED.setBrightness(currentBrightness);
+    FastLED.show();
+    Serial.printf("MQTT brightness: %d\n", currentBrightness);
+    return;
+  }
+
+  if (strcmp (topic, mqttConfig.colorTopic.c_str()) != 0) {
+      return;
+  }
 
   int red;
   int green;
@@ -258,8 +284,11 @@ void connectMqttIfNeeded() {
   }
 
   if (connected) {
-    Serial.printf("Connected to MQTT; subscribing to %s\n", mqttConfig.colorTopic.c_str());
+    Serial.printf("Connected to MQTT; subscribing to %s\n", 
+                  mqttConfig.colorTopic.c_str(),
+                  mqttConfig.brightnessTopic.c_str());
     mqttClient.subscribe(mqttConfig.colorTopic.c_str());
+    mqttClient.subscribe(mqttConfig.brightnessTopic.c_str());
   } else {
     Serial.printf("MQTT connection failed, state %d\n", mqttClient.state());
   }
@@ -366,7 +395,7 @@ void setup() {
   }
 
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(50);
+  FastLED.setBrightness(currentBrightness);
 
   setStripPower(true);
   setLedColor(20, 20, 20);
