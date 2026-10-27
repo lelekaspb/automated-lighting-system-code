@@ -2,5 +2,7 @@ platformio.ini
 .pio/
 .vscode/
 settings.json
+mqtt_config.h
+notes.txt
 
 /arduino/
