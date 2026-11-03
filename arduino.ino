@@ -8,6 +8,8 @@
 #include <string.h>
 #include <time.h>
 #include "mqtt_root_ca.h"
+#include <ArduinoJson.h>
+
 
 
 #if __has_include("mqtt_config.h")
@@ -40,11 +42,11 @@
 // ============================================================================
 
 #define NUM_LEDS 137
-#define DATA_PIN 5
+#define DATA_PIN 16
 #define LDR_PIN 34
 // Default for the runtime LDR switch (see setLdrEnabled()).
 #define ENABLE_LDR_CONTROL true
-#define DEFAULT_BRIGHTNESS 50
+#define DEFAULT_BRIGHTNESS 20
 #define STARTUP_TEST_MS 1500
 #define MAX_SAVED_WIFI_NETWORKS 10
 
@@ -73,6 +75,8 @@ uint8_t currentBrightness = DEFAULT_BRIGHTNESS;
 bool isLight = false;                       // ambient light state from the LDR
 bool ldrEnabled = ENABLE_LDR_CONTROL;       // runtime switch; false = strip stays off
 uint32_t lastLdrRead = 0;
+uint16_t darkThreshold = DARK_THRESHOLD;
+#define THRESHOLD_GAP 100
 
 // MQTT
 WiFiClientSecure wifiClient;
@@ -271,6 +275,43 @@ bool saveWifiCredentials(const String& ssid, const String& password) {
   return saved;
 }
 
+bool forgetWifiCredentials(const String& ssid) {
+  Preferences preferences;
+  if (!preferences.begin("wifi", false)) {
+    Serial.println("Could not open Wi-Fi NVS namespace for writing.");
+    return false;
+  }
+  bool removed = false;
+
+  if (preferences.getString("ssid", "") == ssid) {
+    preferences.remove("ssid");
+    preferences.remove("pass");
+    removed = true;
+  }
+  for (int i = 0; i < MAX_SAVED_WIFI_NETWORKS; i++) {
+    String ssidKey = "ssid" + String(i);
+    String passKey = "pass" + String(i);
+    if (preferences.getString(ssidKey.c_str(), "") == ssid) {
+      preferences.remove(ssidKey.c_str());
+      preferences.remove(passKey.c_str());
+      removed = true;
+    }
+  }
+  preferences.end();
+  return removed;
+  }
+  bool forgetAllWifiCredentials() {
+  Preferences preferences;
+  if (!preferences.begin("wifi", false)) {
+    Serial.println("Could not open Wi-Fi NVS namespace for writing.");
+    return false;
+  }
+  bool cleared = preferences.clear();   // empties the whole "wifi" drawer
+  preferences.end();
+  return cleared;
+  } 
+
+
 bool loadWifiNetworks() {
   Serial.println("Checking saved Wi-Fi networks in NVS.");
   savedWifiNetworkCount = 0;
@@ -401,6 +442,9 @@ bool ledsShouldBeOn() {
 }
 
 void applyLedState() {
+  Serial.printf("applyLedState: on=%d  brightness=%d  color=%d,%d,%d\n",
+                ledsShouldBeOn(), currentBrightness,
+                currentColor.r, currentColor.g, currentColor.b);   // DEBUG
   if (!ledsShouldBeOn()) {
     FastLED.clear();
     FastLED.show();
@@ -453,6 +497,25 @@ int readAverageLdr() {
   return avg;
 }
 
+void loadLdrThreshold() {
+  Preferences preferences;
+  if (!preferences.begin("ldr", true)) {
+    return;   
+  }
+  darkThreshold = preferences.getUShort("dark", DARK_THRESHOLD);
+  preferences.end();
+}
+
+bool saveLdrThreshold(uint16_t value) {
+  Preferences preferences;
+  if (!preferences.begin("ldr", false)) {
+    return false;
+  }
+  bool saved = preferences.putUShort("dark", value) > 0;
+  preferences.end();
+  return saved;
+}
+
 void updateLdrState() {
   if (!ldrEnabled || (lastLdrRead != 0 && millis() - lastLdrRead < LDR_POLL_INTERVAL_MS)) {
     return;
@@ -463,9 +526,9 @@ void updateLdrState() {
   bool previousState = isLight;
   Serial.printf("LDR: %d\n", ldrValue);
 
-  if (ldrValue > BRIGHT_THRESHOLD) {
+  if (ldrValue > darkThreshold + THRESHOLD_GAP) {
     isLight = true;
-  } else if (ldrValue < DARK_THRESHOLD) {
+  } else if (ldrValue < darkThreshold) {
     isLight = false;
   }
 
@@ -521,6 +584,7 @@ void loadMqttConfig() {
 }
 
 void subscribeMqttTopics();  // defined in the MQTT TOPICS section
+void publishSavedWifiList();
 
 void connectMqttIfNeeded() {
   if (mqttClient.connected() || WiFi.status() != WL_CONNECTED || mqttConfig.serverHost.isEmpty()) {
@@ -537,6 +601,7 @@ void connectMqttIfNeeded() {
 
   lastMqttAttempt = now;
   bool connected;
+   Serial.printf("MQTT user: %s\n", mqttConfig.username.c_str()); 
   if (mqttConfig.username.isEmpty()) {
     connected = mqttClient.connect(mqttConfig.clientId.c_str());
   } else {
@@ -546,6 +611,7 @@ void connectMqttIfNeeded() {
   if (connected) {
     Serial.println("Connected to MQTT.");
     subscribeMqttTopics();
+    publishSavedWifiList();
   } else {
     Serial.printf("MQTT connection failed, state %d\n", mqttClient.state());
   }
@@ -562,6 +628,8 @@ void connectMqttIfNeeded() {
 //                          (default esp32/led/color, configurable in NVS)
 //   esp32/led/brightness   0-255                   Sets strip brightness
 //   esp32/ldr/enabled      1/0, true/false, on/off Automatic lighting on / off (0 = strip stays off)
+//   esp32/wifi/add         {"ssid":"..","pass":".."} Saves a Wi-Fi network in NVS (do NOT retain)
+//   esp32/wifi/forget      "<ssid>" or "all"       Removes one / all saved Wi-Fi networks (do NOT retain)
 //
 // To add a topic: write a handler, add a name constant (if fixed), and add one
 // row to MQTT_TOPICS below. Subscribing and dispatching are automatic.
@@ -569,6 +637,38 @@ void connectMqttIfNeeded() {
 
 const char *BRIGHTNESS_TOPIC = "esp32/led/brightness";
 const char *LDR_ENABLE_TOPIC = "esp32/ldr/enabled";
+const char *WIFI_ADD_TOPIC = "esp32/wifi/add";
+const char *WIFI_FORGET_TOPIC = "esp32/wifi/forget";
+const char *WIFI_SAVED_TOPIC = "esp32/wifi/saved";
+const char *LDR_THRESHOLD_TOPIC = "esp32/ldr/threshold";
+
+void publishSavedWifiList() {
+  Preferences preferences;
+  if (!preferences.begin("wifi", true)) {
+    return;
+  }
+
+  JsonDocument doc;
+  JsonArray list = doc.to<JsonArray>();   
+
+  String legacySsid = preferences.getString("ssid", "");   
+  if (!legacySsid.isEmpty()) {
+    list.add(legacySsid);
+  }
+  for (int i = 0; i < MAX_SAVED_WIFI_NETWORKS; i++) {      
+    String key = "ssid" + String(i);
+    String ssid = preferences.getString(key.c_str(), "");
+    if (!ssid.isEmpty()) {
+      list.add(ssid);
+    }
+  }
+  preferences.end();
+
+  char buffer[512];
+  serializeJson(doc, buffer, sizeof(buffer));             
+  mqttClient.publish(WIFI_SAVED_TOPIC, buffer, true);      
+  Serial.printf("Published saved Wi-Fi list: %s\n", buffer);
+}
 
 void handleColorMessage(const char* message) {
   int red;
@@ -606,7 +706,72 @@ void handleLdrEnableMessage(const char* message) {
     Serial.println("Invalid LDR payload. Publish 1 or 0.");
   }
 }
+void handleLdrThresholdMessage(const char* message) {   
+  int value;
+  char extra;
+  if (sscanf(message, " %d %c", &value, &extra) != 1 ||
+      value < 0 || value > 4095 - THRESHOLD_GAP) {
+    Serial.println("Invalid threshold. Publish a number from 0 to 3995.");
+    return;
+  }
 
+  darkThreshold = value;
+  saveLdrThreshold(value);
+  Serial.printf("LDR threshold: dark below %d, bright above %d\n",
+                darkThreshold, darkThreshold + THRESHOLD_GAP);
+
+  lastLdrRead = 0;      
+  updateLdrState();
+}
+
+
+void handleWifiAddMessage(const char* message) {
+    JsonDocument doc;
+  if (deserializeJson(doc, message)) {
+    Serial.println("Invalid Wi-Fi message. Use {\"ssid\":\"...\",\"pass\":\"...\"}");
+    return;
+  }
+  String ssid = doc["ssid"] | "";
+  String pass = doc["pass"] | "";
+
+  if (ssid.isEmpty() || ssid.length() > 32 || pass.length() > 63 ||
+      (!pass.isEmpty() && pass.length() < 8)) {
+    Serial.println("Rejected Wi-Fi credentials: invalid SSID or password length.");
+    return;
+  }
+
+  if (saveWifiCredentials(ssid, pass)) {
+    Serial.printf("Saved Wi-Fi network: %s\n", ssid.c_str());
+    publishSavedWifiList();
+  } else {
+    Serial.println("Could not save Wi-Fi network.");
+  }
+}
+void handleWifiForgetMessage(const char* message) {   
+  String ssid = message;
+  ssid.trim();  
+  if (ssid.isEmpty()) {
+    Serial.println("Send a network name, or 'all'.");
+    return;
+  }
+
+  if (ssid == "all") {
+    if (forgetAllWifiCredentials()) {
+      Serial.println("Forgot all saved Wi-Fi networks. Setup portal opens after the next restart.");
+      publishSavedWifiList();
+    } else {
+      Serial.println("Could not forget saved Wi-Fi networks.");
+    }
+    return;
+  }
+
+  if (forgetWifiCredentials(ssid)) {
+    Serial.printf("Forgot Wi-Fi network: %s\n", ssid.c_str());
+    publishSavedWifiList();
+  } else {
+    Serial.printf("No saved Wi-Fi network named: %s\n", ssid.c_str());
+  }
+}
 struct MqttTopic {
   const char* (*name)();
   void (*handler)(const char* message);
@@ -615,11 +780,17 @@ struct MqttTopic {
 const char* colorTopicName() { return mqttConfig.colorTopic.c_str(); }
 const char* brightnessTopicName() { return BRIGHTNESS_TOPIC; }
 const char* ldrEnableTopicName() { return LDR_ENABLE_TOPIC; }
+const char* wifiAddTopicName() { return WIFI_ADD_TOPIC; }
+const char* wifiForgetTopicName() { return WIFI_FORGET_TOPIC; }
+const char* ldrThresholdTopicName() { return LDR_THRESHOLD_TOPIC; }
 
 const MqttTopic MQTT_TOPICS[] = {
   {colorTopicName,      handleColorMessage},
   {brightnessTopicName, handleBrightnessMessage},
   {ldrEnableTopicName,  handleLdrEnableMessage},
+  {wifiAddTopicName, handleWifiAddMessage},
+  {wifiForgetTopicName, handleWifiForgetMessage},
+  {ldrThresholdTopicName, handleLdrThresholdMessage}
 };
 const size_t MQTT_TOPIC_COUNT = sizeof(MQTT_TOPICS) / sizeof(MQTT_TOPICS[0]);
 
@@ -632,11 +803,11 @@ void subscribeMqttTopics() {
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  if (length >= 32) {
+  if (length >= 128) {
     return;
   }
 
-  char message[32];
+  char message[128];
   memcpy(message, payload, length);
   message[length] = '\0';
 
@@ -657,6 +828,7 @@ void setup() {
   Serial.begin(115200);
   loadMqttConfig();
   configureLdrAdc();
+  loadLdrThreshold();
 
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
 
@@ -665,15 +837,16 @@ void setup() {
   currentColor = CRGB(255, 200, 100);
   if (ldrEnabled) {
     int ldrValue = readAverageLdr();
-    if (ldrValue > BRIGHT_THRESHOLD) {
-      isLight = true;
-    } else if (ldrValue < DARK_THRESHOLD) {
-      isLight = false;
+      if (ldrValue > darkThreshold + THRESHOLD_GAP) {
+    isLight = true;
+    } else if (ldrValue < darkThreshold) {
+    isLight = false;
     }
   }
   applyLedState();
 
   mqttClient.setServer(mqttConfig.serverHost.c_str(), mqttConfig.serverPort);
+  mqttClient.setBufferSize(512);
   mqttClient.setCallback(onMqttMessage);
   wifiClient.setCACert(mqttRootCa);
 
@@ -698,5 +871,11 @@ void loop() {
   connectMqttIfNeeded();
   mqttClient.loop();
   updateLdrState();
+  static bool wasConnected = false;                       // DEBUG
+  if (wasConnected && !mqttClient.connected()) {
+    Serial.printf("MQTT disconnected! state=%d, WiFi=%d\n",
+                  mqttClient.state(), WiFi.status());
+  }
+  wasConnected = mqttClient.connected();
   delay(2);
 }
