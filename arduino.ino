@@ -9,6 +9,8 @@
 #include <time.h>
 #include "mqtt_root_ca.h"
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <INA226_WE.h>
 
 
 
@@ -77,6 +79,12 @@ bool ldrEnabled = ENABLE_LDR_CONTROL;       // runtime switch; false = strip sta
 uint32_t lastLdrRead = 0;
 uint16_t darkThreshold = DARK_THRESHOLD;
 #define THRESHOLD_GAP 100
+
+//Battery (INA226)
+INA226_WE ina226 = INA226_WE(0x40);      
+bool inaReady = false;                   
+uint32_t lastInaRead = 0;                
+#define INA_INTERVAL_MS 5000 
 
 // MQTT
 WiFiClientSecure wifiClient;
@@ -559,6 +567,35 @@ void setLdrEnabled(bool enabled) {
 // Public entry points: loadMqttConfig(), connectMqttIfNeeded()
 // ============================================================================
 
+// ============================================================================
+// BATTERY (INA226)                                                       NEW
+// Reads battery voltage (VBS) and current (shunt IN+ -> IN-) every
+// INA_INTERVAL_MS. Positive current = discharging, negative = charging.
+// ============================================================================
+
+void setupIna() {
+  Wire.begin(21, 22);
+  inaReady = ina226.init();
+  if (inaReady) {
+    ina226.setResistorRange(0.1, 0.8);   // R100 shunt = 0.1 ohm, max ~0.8 A
+    Serial.println("INA226 ready.");
+  } else {
+    Serial.println("INA226 not found, continuing without it.");
+  }
+}
+
+void readInaIfNeeded() {
+  if (!inaReady || millis() - lastInaRead < INA_INTERVAL_MS) {
+    return;
+  }
+  lastInaRead = millis();
+
+  ina226.readAndClearFlags();
+  float voltage = ina226.getBusVoltage_V();
+  float current = ina226.getCurrent_mA();
+  Serial.printf("Battery: %.2f V   Current: %.1f mA\n", voltage, current);
+}
+// ============================== end BATTERY =================================
 struct MqttConfig {
   String serverHost;
   uint16_t serverPort;
@@ -829,6 +866,7 @@ void setup() {
   loadMqttConfig();
   configureLdrAdc();
   loadLdrThreshold();
+  setupIna();
 
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
 
@@ -871,6 +909,8 @@ void loop() {
   connectMqttIfNeeded();
   mqttClient.loop();
   updateLdrState();
+  readInaIfNeeded();
+  
   static bool wasConnected = false;                       // DEBUG
   if (wasConnected && !mqttClient.connected()) {
     Serial.printf("MQTT disconnected! state=%d, WiFi=%d\n",
