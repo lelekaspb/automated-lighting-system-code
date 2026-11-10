@@ -7,7 +7,7 @@ An ambient light-reactive LED strip controller built with an ESP32, a WS2812B LE
 - Reads ambient light through GPIO34 using the ESP32 ADC (Analog-to-Digital Converter), once per second, and prints `LDR: <value>` to the Serial Monitor.
 - Averages 12 sensor samples to reduce noise.
 - Uses separate bright and dark thresholds (hysteresis) to avoid rapid flickering around the light boundary.
-- Drives 137 WS2812B LEDs through GPIO5 using FastLED.
+- Drives 137 WS2812B LEDs through GPIO16 using FastLED.
 - Runs a short startup LED test before reading the sensor.
 - Connects to Wi-Fi and an MQTT broker (TLS) to receive commands.
 - The automatic lighting can be switched on and off at runtime (`setLdrEnabled()`, or the `esp32/ldr/enabled` topic).
@@ -36,16 +36,26 @@ To add a topic, write a handler and add one row to `MQTT_TOPICS[]`; subscribing 
 
 ## Wi-Fi Setup
 
-On startup, the ESP32 scans for networks and skips saved networks that are not in range. It tries each visible saved network before starting its
+On startup, the ESP32 scans for networks and tries each saved network before starting its
 `ESP32-Setup` access point. If none connect (or no networks have been saved),
 the setup page is available at `http://192.168.4.1`. Enter the network details
-and choose **Save this network for later use** to retain them. Leaving the box
+and an access password, then choose **Set and connect**. On first setup, the
+access password is stored as a salted key in NVS and is used to log in to the
+web app. On later visits, enter the existing access password to authorize setup;
+this form does not change it. Choose **Save this network for later use** to
+retain the Wi-Fi credentials. Leaving the box
 unchecked connects for the current session only. Up to 10 networks can be
 saved; adding an already-saved SSID updates its password.
 
 Send `W` in the Serial Monitor to open the setup portal again without deleting
 saved networks. Credentials from older versions of the sketch are retained and
 tried as a saved network.
+
+The web app verifies the access password using an MQTT challenge; the ESP32
+must be connected to the broker for login. The broker must permit the device to
+subscribe to `esp32/auth/request` and publish to `esp32/auth/response/+`. Use
+broker ACLs and separate credentials so no other client can publish responses
+and impersonate the device.
 
 ## Hardware
 See [ESP32 pin reference](esp32_pin_reference.md) for board details and GPIO notes.
@@ -96,14 +106,14 @@ The pin configuration is at the top of [arduino.ino](arduino.ino):
 
 ```cpp
 #define NUM_LEDS 137
-#define DATA_PIN 5
+#define DATA_PIN 16
 #define LDR_PIN 34
 ```
 
 | Code symbol | Value | Meaning |
 | --- | --- | --- |
 | `NUM_LEDS` | `137` | Number of LEDs on the strip |
-| `DATA_PIN` | `5` | WS2812B data output pin |
+| `DATA_PIN` | `16` | WS2812B data output pin |
 | `LDR_PIN` | `34` | ADC input for the LDR divider |
 | `ENABLE_LDR_CONTROL` | `true` | Initial state of the runtime switch (`false` = strip starts off) |
 | `DEFAULT_BRIGHTNESS` | `50` | Initial strip brightness (0-255) |

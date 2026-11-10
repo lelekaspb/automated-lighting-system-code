@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <esp_random.h>
+#include <mbedtls/md.h>
+#include <mbedtls/pkcs5.h>
 #include "mqtt_root_ca.h"
 
 
@@ -40,13 +43,23 @@
 // ============================================================================
 
 #define NUM_LEDS 137
-#define DATA_PIN 5
+#define DATA_PIN 16
 #define LDR_PIN 34
 // Default for the runtime LDR switch (see setLdrEnabled()).
 #define ENABLE_LDR_CONTROL true
 #define DEFAULT_BRIGHTNESS 50
 #define STARTUP_TEST_MS 1500
 #define MAX_SAVED_WIFI_NETWORKS 10
+
+// Command authentication (see the ACCESS CONTROL section).
+// Set to false only for development: unsigned MQTT commands are then accepted.
+#define REQUIRE_SIGNED_COMMANDS true
+#define AUTH_KDF_ITERATIONS 10000       // must match the web app
+#define AUTH_KEY_LEN 32
+#define AUTH_SALT_LEN 16
+#define AUTH_MIN_PASSWORD_LEN 8
+#define AUTH_MAX_PASSWORD_LEN 64
+#define AUTH_MAX_CLOCK_SKEW_S 120
 
 // If the averaged LDR reading rises above this value, we treat the room as bright
 // and turn the LEDs off.
@@ -81,6 +94,169 @@ uint32_t lastMqttAttempt = 0;
 bool timeSyncStarted = false;
 
 // ============================================================================
+// ACCESS CONTROL
+// The owner sets an access password in the Wi-Fi setup portal. The ESP32 derives
+// a key with PBKDF2-HMAC-SHA256 (random salt) and stores salt + key in NVS
+// namespace "auth"; the password itself is never stored. The web app verifies a
+// fresh MQTT challenge, then uses the derived key to sign every command:
+//
+//   payload = "<value>;<counter>;<hex HMAC-SHA256(key, topic|value|counter)>"
+//
+// <counter> is Unix time in milliseconds. A command is accepted only if the MAC
+// is valid, the counter is within AUTH_MAX_CLOCK_SKEW_S of the device clock and
+// it is higher than the last accepted one (replay protection).
+//
+// Public entry points: loadAuthConfig(), authenticateCommand()
+// ============================================================================
+
+uint8_t authKey[AUTH_KEY_LEN];
+uint8_t authSalt[AUTH_SALT_LEN];
+bool authConfigured = false;
+uint64_t lastAcceptedCounter = 0;
+
+void toHex(const uint8_t* data, size_t length, char* out) {
+  static const char digits[] = "0123456789abcdef";
+  for (size_t i = 0; i < length; i++) {
+    out[2 * i] = digits[data[i] >> 4];
+    out[2 * i + 1] = digits[data[i] & 0x0f];
+  }
+  out[2 * length] = '\0';
+}
+
+bool constantTimeEquals(const uint8_t* a, const uint8_t* b, size_t length) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff == 0;
+}
+
+bool deriveAuthKey(const String& password, const uint8_t* salt, uint8_t* out) {
+  return mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char*)password.c_str(),
+                                       password.length(), salt, AUTH_SALT_LEN,
+                                       AUTH_KDF_ITERATIONS, AUTH_KEY_LEN, out) == 0;
+}
+
+void loadAuthConfig() {
+  authConfigured = false;
+  Preferences preferences;
+  if (!preferences.begin("auth", true)) {
+    return;
+  }
+  if (preferences.getBytesLength("key") == AUTH_KEY_LEN &&
+      preferences.getBytesLength("salt") == AUTH_SALT_LEN) {
+    preferences.getBytes("key", authKey, AUTH_KEY_LEN);
+    preferences.getBytes("salt", authSalt, AUTH_SALT_LEN);
+    authConfigured = true;
+  }
+  preferences.end();
+}
+
+// Check the existing access password before accepting setup changes.
+bool verifyAuthPassword(const String& password) {
+  if (!authConfigured) {
+    return false;
+  }
+  uint8_t candidate[AUTH_KEY_LEN];
+  return deriveAuthKey(password, authSalt, candidate) &&
+         constantTimeEquals(candidate, authKey, AUTH_KEY_LEN);
+}
+
+bool saveAuthPassword(const String& password) {
+  uint8_t salt[AUTH_SALT_LEN];
+  uint8_t key[AUTH_KEY_LEN];
+  esp_fill_random(salt, sizeof(salt));
+  if (!deriveAuthKey(password, salt, key)) {
+    return false;
+  }
+
+  Preferences preferences;
+  if (!preferences.begin("auth", false)) {
+    return false;
+  }
+  bool saved = preferences.putBytes("salt", salt, sizeof(salt)) == sizeof(salt) &&
+               preferences.putBytes("key", key, sizeof(key)) == sizeof(key);
+  preferences.end();
+  if (!saved) {
+    return false;
+  }
+
+  memcpy(authSalt, salt, sizeof(salt));
+  memcpy(authKey, key, sizeof(key));
+  authConfigured = true;
+  lastAcceptedCounter = 0;
+  return true;
+}
+
+// Verifies "<value>;<counter>;<mac>" and, on success, cuts `message` down to
+// just <value> so the topic handler sees the plain payload.
+bool authenticateCommand(const char* topic, char* message) {
+  if (!REQUIRE_SIGNED_COMMANDS) {
+    return true;
+  }
+  if (!authConfigured) {
+    Serial.println("Rejected command: no access password set (send W to set one).");
+    return false;
+  }
+
+  char* macSeparator = strrchr(message, ';');
+  if (macSeparator == nullptr) {
+    Serial.println("Rejected command: missing signature.");
+    return false;
+  }
+  *macSeparator = '\0';
+  const char* macHex = macSeparator + 1;
+
+  char* counterSeparator = strrchr(message, ';');
+  if (counterSeparator == nullptr) {
+    Serial.println("Rejected command: missing counter.");
+    return false;
+  }
+  *counterSeparator = '\0';
+  const char* counterText = counterSeparator + 1;
+
+  size_t counterLength = strlen(counterText);
+  if (strlen(macHex) != 2 * 32 || counterLength == 0 || counterLength > 15) {
+    Serial.println("Rejected command: malformed signature.");
+    return false;
+  }
+  for (size_t i = 0; i < counterLength; i++) {
+    if (counterText[i] < '0' || counterText[i] > '9') {
+      Serial.println("Rejected command: malformed counter.");
+      return false;
+    }
+  }
+
+  uint64_t counter = strtoull(counterText, nullptr, 10);
+  int64_t skew = (int64_t)(counter / 1000) - (int64_t)time(nullptr);
+  if (skew > AUTH_MAX_CLOCK_SKEW_S || skew < -AUTH_MAX_CLOCK_SKEW_S) {
+    Serial.println("Rejected command: stale or future timestamp.");
+    return false;
+  }
+  if (counter <= lastAcceptedCounter) {
+    Serial.println("Rejected command: replayed counter.");
+    return false;
+  }
+
+  String signedData = String(topic) + "|" + message + "|" + counterText;
+  uint8_t mac[32];
+  char expectedHex[2 * 32 + 1];
+  if (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), authKey, AUTH_KEY_LEN,
+                      (const unsigned char*)signedData.c_str(), signedData.length(), mac) != 0) {
+    return false;
+  }
+  toHex(mac, sizeof(mac), expectedHex);
+  if (!constantTimeEquals((const uint8_t*)expectedHex, (const uint8_t*)macHex, 2 * 32)) {
+    Serial.println("Rejected command: bad signature.");
+    return false;
+  }
+
+  lastAcceptedCounter = counter;
+  return true;
+}
+// ============================== end ACCESS CONTROL ==========================
+
+// ============================================================================
 // WIFI
 // Everything about getting the ESP32 online lives in this section.
 //
@@ -99,17 +275,18 @@ const char *AP_PASSWORD = "setup1234";
 WebServer server(80);
 bool portalConnected = false;
 
-const char FORM[] PROGMEM = R"(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+const char FORM[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Setup</title></head><body>
 <h2>WiFi setup</h2>
 <form method="POST" action="/save">
   <p><input name="ssid" placeholder="SSID" required></p>
-  <p><input name="pass" type="password" placeholder="Password"></p>
-  <p><label><input name="save" type="checkbox" value="yes"> Save this network for later use</label></p>
-  <button type="submit">Connect</button>
+  <p><input name="pass" type="password" placeholder="Wi-Fi password"></p>
+  <p><input name="devpass" type="password" placeholder="Access password (8-64 characters)" minlength="8" maxlength="64" required></p>
+  <p>Use your existing access password if one is already set.</p>
+  <p><label><input name="save" type="checkbox" value="yes" checked> Save this network for later use</label></p>
+  <button type="submit">Set and connect</button>
 </form></body></html>
-)";
+)HTML";
 
 void handleRoot() { server.send_P(200, "text/html", FORM); }
 
@@ -127,6 +304,19 @@ void handleSave() {
     return;
   }
 
+  String accessPassword = server.arg("devpass");
+  if (accessPassword.length() < AUTH_MIN_PASSWORD_LEN ||
+      accessPassword.length() > AUTH_MAX_PASSWORD_LEN) {
+    server.send(400, "text/plain", "Access password must be 8-64 bytes.");
+    return;
+  }
+  if (authConfigured && !verifyAuthPassword(accessPassword)) {
+    delay(1000);
+    Serial.println("Rejected setup: wrong access password.");
+    server.send(403, "text/plain", "Access password is wrong.");
+    return;
+  }
+
   Serial.printf("Trying Wi-Fi credentials for SSID: %s\n", ssid.c_str());
   beginStaConnection(ssid, password, WIFI_AP_STA);
   uint32_t startedAt = millis();
@@ -138,6 +328,12 @@ void handleSave() {
     WiFi.disconnect(false, true);
     server.send(200, "text/plain",
                 "Could not connect to that network. Check the details and try again.");
+    return;
+  }
+
+  if (!authConfigured && !saveAuthPassword(accessPassword)) {
+    Serial.println("Could not save access password.");
+    server.send(500, "text/plain", "Could not save the access password.");
     return;
   }
 
@@ -158,6 +354,7 @@ void handleSave() {
   } else {
     response += "Could not save credentials for later use.";
   }
+  response += "\nAccess password configured.";
   server.send(saved ? 200 : 500, "text/plain", response);
 }
 
@@ -554,7 +751,9 @@ void connectMqttIfNeeded() {
 
 // ============================================================================
 // MQTT TOPICS
-// All topics the ESP32 listens to live in this section.
+// All topics the ESP32 listens to live in this section. Every payload must be
+// signed (see ACCESS CONTROL): "<payload>;<counter>;<mac>". The payloads below
+// are the plain values after verification.
 //
 //   Topic                  Payload                 Effect
 //   ---------------------  ----------------------  ----------------------------
@@ -569,6 +768,37 @@ void connectMqttIfNeeded() {
 
 const char *BRIGHTNESS_TOPIC = "esp32/led/brightness";
 const char *LDR_ENABLE_TOPIC = "esp32/ldr/enabled";
+const char *AUTH_REQUEST_TOPIC = "esp32/auth/request";
+const char *AUTH_RESPONSE_PREFIX = "esp32/auth/response/";
+
+void handleAuthRequest(const char* message) {
+  // The request is a random response identifier followed by a random challenge.
+  if (!authConfigured || strlen(message) != 97 || message[32] != '|') {
+    return;
+  }
+  for (size_t i = 0; i < 97; i++) {
+    if (i != 32 && !((message[i] >= '0' && message[i] <= '9') ||
+                     (message[i] >= 'a' && message[i] <= 'f'))) {
+      return;
+    }
+  }
+  String signedData = String("login|") + message;
+  uint8_t mac[32];
+  if (mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), authKey, AUTH_KEY_LEN,
+                      (const unsigned char*)signedData.c_str(), signedData.length(), mac) != 0) {
+    Serial.println("Could not sign login challenge.");
+    return;
+  }
+  char saltHex[AUTH_SALT_LEN * 2 + 1];
+  char macHex[65];
+  toHex(authSalt, sizeof(authSalt), saltHex);
+  toHex(mac, sizeof(mac), macHex);
+  String responseTopic = String(AUTH_RESPONSE_PREFIX) + String(message).substring(0, 32);
+  String response = String(saltHex) + "|" + macHex;
+  if (!mqttClient.publish(responseTopic.c_str(), response.c_str())) {
+    Serial.println("Could not publish login challenge response.");
+  }
+}
 
 void handleColorMessage(const char* message) {
   int red;
@@ -624,6 +854,9 @@ const MqttTopic MQTT_TOPICS[] = {
 const size_t MQTT_TOPIC_COUNT = sizeof(MQTT_TOPICS) / sizeof(MQTT_TOPICS[0]);
 
 void subscribeMqttTopics() {
+  if (!mqttClient.subscribe(AUTH_REQUEST_TOPIC)) {
+    Serial.println("Could not subscribe to login requests.");
+  }
   for (size_t i = 0; i < MQTT_TOPIC_COUNT; i++) {
     const char* name = MQTT_TOPICS[i].name();
     mqttClient.subscribe(name);
@@ -632,17 +865,25 @@ void subscribeMqttTopics() {
 }
 
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  if (length >= 32) {
+  // Room for "<value>;<counter>;<64 hex MAC>" (see ACCESS CONTROL).
+  char message[160];
+  if (length >= sizeof(message)) {
     return;
   }
 
-  char message[32];
   memcpy(message, payload, length);
   message[length] = '\0';
 
+  if (strcmp(topic, AUTH_REQUEST_TOPIC) == 0) {
+    handleAuthRequest(message);
+    return;
+  }
+
   for (size_t i = 0; i < MQTT_TOPIC_COUNT; i++) {
     if (strcmp(topic, MQTT_TOPICS[i].name()) == 0) {
-      MQTT_TOPICS[i].handler(message);
+      if (authenticateCommand(topic, message)) {
+        MQTT_TOPICS[i].handler(message);
+      }
       return;
     }
   }
@@ -656,6 +897,10 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 void setup() {
   Serial.begin(115200);
   loadMqttConfig();
+  loadAuthConfig();
+  if (REQUIRE_SIGNED_COMMANDS && !authConfigured) {
+    Serial.println("No access password set: MQTT commands are rejected until one is set (send W).");
+  }
   configureLdrAdc();
 
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
