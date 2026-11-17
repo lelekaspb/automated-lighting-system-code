@@ -583,7 +583,31 @@ void setupIna() {
     Serial.println("INA226 not found, continuing without it.");
   }
 }
+const float   BATTERY_VOLTS[]   = {3.30, 3.40, 3.50, 3.60, 3.65, 3.70, 3.75, 3.80, 3.90, 4.00, 4.10, 4.20};
+const uint8_t BATTERY_PERCENT[] = {   0,    2,    5,   12,   20,   30,   40,   50,   65,   80,   90,  100};
+const int BATTERY_POINTS = sizeof(BATTERY_VOLTS) / sizeof(BATTERY_VOLTS[0]);
 
+int batteryPercent(float voltage) {
+  if (voltage <= BATTERY_VOLTS[0]) {
+    return 0;
+  }
+  if (voltage >= BATTERY_VOLTS[BATTERY_POINTS - 1]) {
+    return 100;
+  }
+
+  for (int i = 1; i < BATTERY_POINTS; i++) {
+    if (voltage < BATTERY_VOLTS[i]) {
+      float lowV  = BATTERY_VOLTS[i - 1];
+      float highV = BATTERY_VOLTS[i];
+      float lowP  = BATTERY_PERCENT[i - 1];
+      float highP = BATTERY_PERCENT[i];
+
+      float fraction = (voltage - lowV) / (highV - lowV);
+      return (int)(lowP + fraction * (highP - lowP) + 0.5);
+    }
+  }
+  return 100;
+}
 void readInaIfNeeded() {
   if (!inaReady || millis() - lastInaRead < INA_INTERVAL_MS) {
     return;
@@ -593,7 +617,8 @@ void readInaIfNeeded() {
   ina226.readAndClearFlags();
   float voltage = ina226.getBusVoltage_V();
   float current = ina226.getCurrent_mA();
-  Serial.printf("Battery: %.2f V   Current: %.1f mA\n", voltage, current);
+  int percent = batteryPercent(voltage);                                     // NEW
+  Serial.printf("Battery: %.2f V  %d %%   Current: %.1f mA\n", voltage, percent, current);
 }
 // ============================== end BATTERY =================================
 struct MqttConfig {
@@ -890,6 +915,10 @@ void setup() {
 
   connectWifiOrStartPortal();
   Serial.println("Send W in Serial Monitor to change Wi-Fi credentials.");
+  
+  Serial.printf("Test 3.85 V -> %d %%\n", batteryPercent(3.85));   // TEST: expect 58
+  Serial.printf("Test 3.30 V -> %d %%\n", batteryPercent(3.30));   // TEST: expect 0
+  Serial.printf("Test 4.20 V -> %d %%\n", batteryPercent(4.20));   // TEST: expect 100
 }
 
 void loop() {
