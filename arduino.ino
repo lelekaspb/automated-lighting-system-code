@@ -47,7 +47,7 @@
 // ============================================================================
 
 #define NUM_LEDS 137
-#define DATA_PIN 5
+#define DATA_PIN 16
 #define LDR_PIN 34
 // Default for the runtime LDR switch (see setLdrEnabled()).
 #define ENABLE_LDR_CONTROL true
